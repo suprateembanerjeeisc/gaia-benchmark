@@ -1,0 +1,3 @@
+[Actions]
+CreateDatabase:Name=TEMP_DATA,Directory=/usr/irissys/mgr/TEMP_DATA,Resource=%DB_%DEFAULT
+ModifyService:Name=%Service_CallIn,Enabled=1

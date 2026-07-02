@@ -1,0 +1,22 @@
+ROUTINE RunScript
+ #; Gaia DR3 BP/RP flux-variability benchmark entry point.
+ #; The judges run:  do ^RunScript
+ #; It delegates to Gaia.Benchmark, which reads the 20 EpochPhotometry_*.csv.gz
+ #; files in ./data/in, computes the BP/RP flux percentage change per source,
+ #; and writes the objects whose change exceeds 100% to the challenge output
+ #; CSV at ./data/out/challenge_output.csv.
+
+Run()
+{
+ #; Start time
+ Set startTime = $ZHOROLOG
+
+ Do ##class(Gaia.Benchmark).Process()
+
+ #; End time
+ Set endTime = $ZHOROLOG
+ #; Elapsed time in seconds
+ Set elapsed = endTime - startTime
+ Write "Elapsed time: ", elapsed, " seconds", !
+ Quit
+}
