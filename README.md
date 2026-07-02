@@ -1,6 +1,6 @@
 # InterSystems Programming Challenge 1: Benchmark
 
-Speed-optimized solution to the challenge: identify Gaia DR3 sources whose **BP or RP flux changed by more than 100%** over the observation period and write the result CSV. Optimized for **shortest execution time** via parallel parsing, ≈1.3 seconds (see the sibling release `gaia-codegolf` for the minimal-code variant).
+Speed-optimized solution to the challenge: identify Gaia DR3 sources whose **BP or RP flux changed by more than 100%** over the observation period and write the result CSV. Optimized for **shortest execution time** via parallel parsing, ≈1.3 seconds (see the sibling repo `gaia-codegolf` for the minimal-code variant).
 
 ## Build & run
 
