@@ -10,7 +10,7 @@ docker-compose exec iris iris session iris
 USER>do ^RunScript
 ```
 
-This writes `data/out/challenge_output.csv` (~0.8 s warm; the first run of a fresh container is ~1.3 s while Python/Polars load).
+This writes `data/out/challenge_output.csv` (~0.8 s warm).
 
 ## How it works
 
@@ -36,5 +36,3 @@ other band contributes to `percentage_change`.
 ## Verifiable Result
 
 - **~0.8 seconds** warm to process all 20 files (down from ~12 s single-threaded).
-- The wall clock sits close to the raw-decompression floor: the ~1.5 GB of gzip in these 20 files is the irreducible cost, and profiling confirmed the parse/compute adds almost nothing on top.
-- Rejected with evidence: `cramjam`/libdeflate as a drop-in decoder was *slower* here (routing bytes through its Python wrapper cost more than the faster decode saved), and a `multiprocessing` pool deadlocks inside the IRIS process. The input `.csv.gz` files are read as-is — decompression is part of the measured work, not pre-computed away.
