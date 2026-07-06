@@ -4,6 +4,9 @@ FROM $IMAGE
 WORKDIR /home/irisowner/dev
 COPY . .
 
+## Polars provides the native (Rust) vectorized parse used by the benchmark.
+RUN pip install --no-cache-dir --break-system-packages polars
+
 ## Embedded Python environment
 ENV IRISUSERNAME="_SYSTEM"
 ENV IRISPASSWORD="SYS"

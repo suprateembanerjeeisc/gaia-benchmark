@@ -1,6 +1,6 @@
 # InterSystems Programming Challenge 1: Benchmark
 
-Speed-optimized solution to the challenge: identify Gaia DR3 sources whose **BP or RP flux changed by more than 100%** over the observation period and write the result CSV. Optimized for **shortest execution time** via parallel parsing, ≈1.3 seconds (see the sibling repo `gaia-codegolf` for the minimal-code variant).
+Speed-optimized solution to the challenge: identify Gaia DR3 sources whose **BP or RP flux changed by more than 100%** over the observation period and write the result CSV. Optimized for **shortest execution time** — sub-second warm (~0.8 s) — by treating the job as what it is: decompression-bound (see the sibling repo `gaia-codegolf` for the minimal-code variant).
 
 ## Build & run
 
@@ -10,19 +10,15 @@ docker-compose exec iris iris session iris
 USER>do ^RunScript
 ```
 
-This writes `data/out/challenge_output.csv` (≈1.3 seconds).
+This writes `data/out/challenge_output.csv` (~0.8 s warm; the first run of a fresh container is ~1.3 s while Python/Polars load).
 
 ## How it works
 
-`do ^RunScript` (`src/RunScript.mac`) calls `Gaia.Benchmark.Process()`
-(`src/Gaia/Benchmark.cls`), which spawns `src/gaia_flux.py` as a standalone
-`irispython` process — a `multiprocessing` pool can't run inside the IRIS server
-process (it deadlocks). That script does the whole job:
+`do ^RunScript` (`src/RunScript.mac`) calls `Gaia.Benchmark.Process()` (`src/Gaia/Benchmark.cls`), which runs `src/gaia_flux_polars.py` **entirely in-process** in Embedded Python — no subprocess, no marshalling of rows back into IRIS. The pipeline:
 
-- parses the 20 `data/in/EpochPhotometry_*.csv.gz` files **in parallel**, one worker process **per file** (pool size = file count) so all 20 uneven files start at once.
-- for the `bp_flux` and `rp_flux` arrays of every source, keeps only the valid fluxes and takes their `min` / `max`,
-- computes `((max_flux - min_flux) / min_flux) * 100` per band and keeps the larger of the BP and RP values as `percentage_change`,
-- writes the sources with `percentage_change > 100` (sorted descending) straight to the CSV — the worker writes the CSV itself.
+- **Decompress on a thread pool, largest file first.** Profiling showed the job is decompression-bound, and Python's `gzip` releases the GIL — so the 20 `.csv.gz` files gunzip in genuine parallel across the container's cores. (Threads, not a `multiprocessing` pool: a pool deadlocks when launched inside the IRIS server process; threads do not.) Starting the biggest file first means it — which alone bounds the wall clock — never waits.
+- **Parse + compute vectorized in Polars (native Rust).** The raw CSV bytes go straight to Polars, which reads only the three needed columns, splits each `bp_flux` / `rp_flux` array, keeps the valid (finite, positive) values, and computes `min` / `max` and `((max - min) / min) * 100` per band — all as native column operations, keeping the scan cost near zero.
+- **Filter, sort, write.** Keep `percentage_change > 100` (the larger of the BP and RP change), sort descending, and write the CSV directly from Polars.
 
 Output columns: `source_id`, `bp_min_flux`, `bp_max_flux`, `rp_min_flux`, `rp_max_flux`, `percentage_change`.
 
@@ -31,7 +27,7 @@ Output columns: `source_id`, `bp_min_flux`, `bp_max_flux`, `rp_min_flux`, `rp_ma
 The spec says to ignore *"missing, null, NaN, or otherwise invalid"* flux values. This solution treats a flux as valid only if it is **present, numeric, finite, and strictly positive** — i.e. it drops:
 
 - missing / `null` values
-- `NaN` (detected via `flux == flux`, which is false only for NaN)
+- `NaN` / non-finite values (Polars `is_finite`)
 - zero and negative values
 
 If a band has no valid fluxes, its `min`/`max` cells are left empty and only the
@@ -39,4 +35,6 @@ other band contributes to `percentage_change`.
 
 ## Verifiable Result
 
-- **≈1.3 seconds** to process all 20 files (down from ~12s single-threaded).
+- **~0.8 seconds** warm to process all 20 files (down from ~12 s single-threaded).
+- The wall clock sits close to the raw-decompression floor: the ~1.5 GB of gzip in these 20 files is the irreducible cost, and profiling confirmed the parse/compute adds almost nothing on top.
+- Rejected with evidence: `cramjam`/libdeflate as a drop-in decoder was *slower* here (routing bytes through its Python wrapper cost more than the faster decode saved), and a `multiprocessing` pool deadlocks inside the IRIS process. The input `.csv.gz` files are read as-is — decompression is part of the measured work, not pre-computed away.
