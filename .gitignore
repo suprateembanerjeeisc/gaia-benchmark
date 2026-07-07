@@ -28,3 +28,5 @@ data/temp/EpochPhotometry_020092-020493.csv
 data/temp/EpochPhotometry_020494-020747.csv
 data/temp/EpochPhotometry_020748-020984.csv
 data/temp/EpochPhotometry_020985-021233.csv
+benchmark.csv
+src/gaiascan.so

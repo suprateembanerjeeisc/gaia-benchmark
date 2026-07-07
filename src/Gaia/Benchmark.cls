@@ -9,12 +9,15 @@
 /// larger of the BP and RP values.
 ///
 /// The work runs entirely in-process in Embedded Python. The job is
-/// decompression-bound, so the 20 files are gunzipped on a thread pool
-/// (Python's gzip releases the GIL, giving true parallelism without the
-/// deadlock that an in-process multiprocessing pool hits), largest file first.
-/// Parsing the flux arrays and computing min/max/%change is then done
-/// vectorized in Polars (native Rust), keeping the scan cost near zero so the
-/// wall clock sits close to the raw-decompression floor.
+/// decompression-bound, so both engines gunzip all 20 files in parallel with
+/// the GIL released:
+///   - gaia_fast: a C kernel (gaiascan.so) that decompresses with libdeflate
+///     and scans each file's BP/RP arrays in a single pass (OpenMP over files),
+///     returning only per-source min/max scalars — the fastest path.
+///   - gaia_flux_polars: pure Python/Polars (libdeflate via ctypes + vectorized
+///     parse) — the portable fallback if the C kernel can't be built/loaded.
+/// Both share the same percentage-change / filter / sort / write tail, so the
+/// output is identical.
 Class Gaia.Benchmark
 {
 
@@ -23,8 +26,12 @@ ClassMethod Process() [ Language = python ]
 {
     import sys
     sys.path.insert(0, "/home/irisowner/dev/src")
-    import gaia_flux_polars
-    n = gaia_flux_polars.run()
+    try:
+        import gaia_fast as engine
+    except Exception as exc:
+        print("fast engine unavailable ({}); using Polars engine".format(exc))
+        import gaia_flux_polars as engine
+    n = engine.run()
     print("{} sources changed by more than 100%".format(n))
 }
 
