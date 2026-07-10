@@ -17,10 +17,19 @@ import os
 import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Oversubscribe the OpenMP pool ~1.5x cores so a straggler chunk is picked up by
-# an idle thread. Passed into the kernel (omp_set_num_threads) rather than via
-# OMP_NUM_THREADS, since libgomp is already initialized by the IRIS process.
-NTHREADS = max(16, int((os.cpu_count() or 8) * 3 // 2))
+# The kernel is one fused decompress+scan pass per file. The job is bound by the
+# largest (unsplittable) gzip stream, so once we schedule that file first, extra
+# threads only add memory-bandwidth contention on the parallel decompress —
+# ~0.75x cores measured fastest. Passed into the kernel (omp_set_num_threads)
+# rather than via OMP_NUM_THREADS, since libgomp is already initialized by IRIS.
+# Use the affinity mask (honors Docker --cpuset-cpus / cgroup limits) rather than
+# os.cpu_count(), which reports the whole host and would oversubscribe the kernel
+# 6:1 when the container is pinned to a subset of cores (e.g. 4 of 32).
+try:
+    _NCPU = len(os.sched_getaffinity(0))
+except AttributeError:  # non-Linux
+    _NCPU = os.cpu_count() or 8
+NTHREADS = max(4, int(_NCPU * 3 // 4))
 SO = os.path.join(HERE, "gaiascan.so")
 SRC = os.path.join(HERE, "gaiascan.c")
 IN_DIR = "/home/irisowner/dev/data/in"

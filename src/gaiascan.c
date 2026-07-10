@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <math.h>
 #include <omp.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 struct libdeflate_decompressor;
 struct libdeflate_decompressor *libdeflate_alloc_decompressor(void);
@@ -141,22 +145,37 @@ long gaia_scan(const char **paths, int file_count, long slot, int thread_count,
                int64_t *out_source_id, double *out_bp_min, double *out_bp_max,
                double *out_rp_min, double *out_rp_max, long *counts) {
     if (thread_count > 0) omp_set_num_threads(thread_count);
-    DecompressedFile *files = (DecompressedFile *)calloc(file_count, sizeof(DecompressedFile));
     int had_error = 0;
+    for (int i = 0; i < file_count; i++) counts[i] = 0;
 
-    /* ---- Phase 1: decompress every file in parallel, index its rows. ---- */
-    #pragma omp parallel for schedule(dynamic)
+    /* Process largest files first: with dynamic scheduling this starts the
+       longest (unsplittable) gzip streams at t=0 so they don't strand a thread
+       at the end while everything else has finished. */
+    long *file_size = (long *)malloc(file_count * sizeof(long));
+    int *order = (int *)malloc(file_count * sizeof(int));
     for (int i = 0; i < file_count; i++) {
-        FILE *handle = fopen(paths[i], "rb");
-        if (!handle) { had_error = 1; continue; }
-        fseek(handle, 0, SEEK_END);
-        long compressed_size = ftell(handle);
-        fseek(handle, 0, SEEK_SET);
-        unsigned char *compressed = (unsigned char *)malloc(compressed_size);
-        if (!compressed || fread(compressed, 1, compressed_size, handle) != (size_t)compressed_size) {
-            free(compressed); fclose(handle); had_error = 1; continue;
-        }
-        fclose(handle);
+        order[i] = i;
+        FILE *h = fopen(paths[i], "rb");
+        if (h) { fseek(h, 0, SEEK_END); file_size[i] = ftell(h); fclose(h); }
+        else file_size[i] = 0;
+    }
+    for (int a = 0; a < file_count; a++)          /* tiny n: simple selection sort desc */
+        for (int b = a + 1; b < file_count; b++)
+            if (file_size[order[b]] > file_size[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+
+    /* One fused pass per file: decompress, then scan its rows inline into that
+       file's output slot. No row-offset array, no second parallel region --
+       the scan is ~10x cheaper than decompress, so splitting it buys nothing. */
+    #pragma omp parallel for schedule(dynamic)
+    for (int oi = 0; oi < file_count; oi++) {
+        int i = order[oi];
+        int fd = open(paths[i], O_RDONLY);
+        if (fd < 0) { had_error = 1; continue; }
+        struct stat st; fstat(fd, &st);
+        long compressed_size = st.st_size;
+        unsigned char *compressed = (unsigned char *)mmap(NULL, compressed_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (compressed == MAP_FAILED) { had_error = 1; continue; }
 
         uint32_t uncompressed_size;
         memcpy(&uncompressed_size, compressed + compressed_size - 4, 4);
@@ -169,96 +188,36 @@ long gaia_scan(const char **paths, int file_count, long slot, int thread_count,
         int result = libdeflate_gzip_decompress(decompressor, compressed, compressed_size,
                                                 decompressed, capacity, &decompressed_len);
         libdeflate_free_decompressor(decompressor);
-        free(compressed);
+        munmap(compressed, compressed_size);
         if (result != 0) { free(decompressed); had_error = 1; continue; }
         decompressed[decompressed_len] = 0;
 
         const char *cursor = decompressed, *buf_end = decompressed + decompressed_len;
         while (cursor < buf_end && *cursor == '#') {
-            while (cursor < buf_end && *cursor != '\n') cursor++;
-            if (cursor < buf_end) cursor++;
+            const char *nl = (const char *)memchr(cursor, '\n', buf_end - cursor);
+            cursor = nl ? nl + 1 : buf_end;
         }
         if (cursor < buf_end) {  /* skip header row */
-            while (cursor < buf_end && *cursor != '\n') cursor++;
-            if (cursor < buf_end) cursor++;
+            const char *nl = (const char *)memchr(cursor, '\n', buf_end - cursor);
+            cursor = nl ? nl + 1 : buf_end;
         }
-        long offset_capacity = decompressed_len / 64 + 16;
-        long *row_offsets = (long *)malloc(offset_capacity * sizeof(long));
-        long row_count = 0;
+
+        long base = (long)i * slot, kept = 0;
         while (cursor < buf_end) {
-            if (row_count >= offset_capacity) {
-                offset_capacity *= 2;
-                row_offsets = (long *)realloc(row_offsets, offset_capacity * sizeof(long));
-            }
-            row_offsets[row_count++] = (long)(cursor - decompressed);
-            while (cursor < buf_end && *cursor != '\n') cursor++;
-            if (cursor < buf_end) cursor++;
-        }
-        files[i].data = decompressed;
-        files[i].length = decompressed_len;
-        files[i].row_offsets = row_offsets;
-        files[i].row_count = row_count;
-    }
-    if (had_error) {
-        for (int i = 0; i < file_count; i++) { free(files[i].data); free(files[i].row_offsets); }
-        free(files);
-        return -1;
-    }
-
-    long chunk_total = 0;
-    for (int i = 0; i < file_count; i++)
-        chunk_total += (files[i].row_count + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
-    WorkChunk *chunks = (WorkChunk *)malloc(chunk_total * sizeof(WorkChunk));
-    long chunk_index = 0;
-    for (int i = 0; i < file_count; i++) {
-        for (long row = 0; row < files[i].row_count; row += ROWS_PER_CHUNK) {
-            long last_row = row + ROWS_PER_CHUNK;
-            if (last_row > files[i].row_count) last_row = files[i].row_count;
-            chunks[chunk_index].file_index = i;
-            chunks[chunk_index].first_row = row;
-            chunks[chunk_index].last_row = last_row;
-            chunks[chunk_index].output_base = (long)i * slot + row;
-            chunk_index++;
-        }
-    }
-
-    long *chunk_kept = (long *)calloc(chunk_total, sizeof(long));
-
-    /* ---- Phase 2: scan all chunks in parallel (the big file is now split up). ---- */
-    #pragma omp parallel for schedule(dynamic)
-    for (long c = 0; c < chunk_total; c++) {
-        DecompressedFile *file = &files[chunks[c].file_index];
-        long kept = 0, base = chunks[c].output_base;
-        for (long row = chunks[c].first_row; row < chunks[c].last_row; row++) {
-            const char *row_start = file->data + file->row_offsets[row];
-            const char *row_end = (row + 1 < file->row_count)
-                                  ? file->data + file->row_offsets[row + 1]
-                                  : file->data + file->length;
-            kept += scan_row(row_start, row_end, out_source_id, out_bp_min, out_bp_max,
+            const char *nl = (const char *)memchr(cursor, '\n', buf_end - cursor);
+            const char *row_end = nl ? nl : buf_end;
+            kept += scan_row(cursor, row_end, out_source_id, out_bp_min, out_bp_max,
                              out_rp_min, out_rp_max, base + kept);
+            cursor = nl ? nl + 1 : buf_end;
         }
-        chunk_kept[c] = kept;
+        counts[i] = kept;
+        free(decompressed);
     }
+    free(file_size); free(order);
+    if (had_error) return -1;
 
+    /* Compact per-file slots into one contiguous block. */
     long total = 0;
-    for (int i = 0; i < file_count; i++) counts[i] = 0;
-    long c = 0;
-    for (int i = 0; i < file_count; i++) {
-        long file_base = (long)i * slot, write_pos = file_base;
-        long chunk_count = (files[i].row_count + ROWS_PER_CHUNK - 1) / ROWS_PER_CHUNK;
-        for (long j = 0; j < chunk_count; j++, c++) {
-            long read_pos = file_base + chunks[c].first_row, kept = chunk_kept[c];
-            if (read_pos != write_pos && kept) {
-                memmove(out_source_id + write_pos, out_source_id + read_pos, kept * sizeof(int64_t));
-                memmove(out_bp_min + write_pos, out_bp_min + read_pos, kept * sizeof(double));
-                memmove(out_bp_max + write_pos, out_bp_max + read_pos, kept * sizeof(double));
-                memmove(out_rp_min + write_pos, out_rp_min + read_pos, kept * sizeof(double));
-                memmove(out_rp_max + write_pos, out_rp_max + read_pos, kept * sizeof(double));
-            }
-            write_pos += kept;
-        }
-        counts[i] = write_pos - file_base;
-    }
     for (int i = 0; i < file_count; i++) {
         long file_base = (long)i * slot, count = counts[i];
         if (file_base != total && count) {
@@ -270,9 +229,6 @@ long gaia_scan(const char **paths, int file_count, long slot, int thread_count,
         }
         total += count;
     }
-
-    for (int i = 0; i < file_count; i++) { free(files[i].data); free(files[i].row_offsets); }
-    free(files); free(chunks); free(chunk_kept);
     return total;
 }
 
