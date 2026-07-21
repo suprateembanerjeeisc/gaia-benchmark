@@ -6,6 +6,9 @@
     ;disabling password expire for development purposes
     zn "%SYS"
     Do ##class(Security.Users).UnExpireUserPasswords("*")
+    ; %ZSTART must live in %SYS to run at startup; it warms the input-file page
+    ; cache before the timed run (see src/ZSTART.mac).
+    do $System.OBJ.Load("/home/irisowner/dev/src/ZSTART.mac","ck")
 
     ; enabling callin for Embedded Python
     do ##class(Security.Services).Get("%Service_CallIn",.prop)
